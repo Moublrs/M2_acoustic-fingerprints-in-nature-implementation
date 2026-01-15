@@ -1,0 +1,26 @@
+librosa
+soundfile
+audioread
+
+# 3. Scientific computing
+numpy
+scipy
+pandas
+
+# 4. Machine Learning
+scikit-learn
+umap-learn
+
+# 5. Visualization
+matplotlib
+seaborn
+plotly
+
+# 6. Utilities
+tqdm
+Pillow
+
+# 7. Optional (recommandé)
+jupyterlab
+ipywidgets
+streamlit
