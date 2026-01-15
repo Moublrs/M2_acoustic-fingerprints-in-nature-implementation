@@ -1,0 +1,229 @@
+import os
+import numpy as np
+import multiprocessing as mp
+from pathlib import Path
+from PIL import Image
+from functools import partial
+
+import librosa
+from maad import sound, util
+import io
+import soundfile as sf
+
+
+# ============================================================
+# AUDIO LOADING
+# ============================================================
+
+def load_audio_stereo(path):
+    """
+    Returns: (signal_2d, fs)
+    signal_2d shape: (n_samples, n_channels)
+    """
+    y, fs = sf.read(path, always_2d=True)
+    return y.astype(np.float32, copy=False), fs
+
+
+# ============================================================
+# SPECTROGRAM
+# ============================================================
+
+def get_spectrograms_from_file(path, window):
+    y2d, fs = load_audio_stereo(path)
+    n_samples_per_win = int(fs * window)
+
+    spectrograms_by_ch = []
+
+    for ch in range(y2d.shape[1]):
+        s = y2d[:, ch]
+        slices = sound.wave2frames(s, n_samples_per_win).T
+
+        specs = []
+        for slc in slices:
+            D = librosa.stft(
+                slc,
+                n_fft=1024,
+                hop_length=512,
+                window="hann"
+            )
+            magnitude = np.abs(D) ** 2
+            Sxx = magnitude / fs
+            specs.append(Sxx)
+
+        spectrograms_by_ch.append(np.array(specs))
+
+    return spectrograms_by_ch
+
+
+# ============================================================
+# IMAGE CONVERSION
+# ============================================================
+
+def get_image_from_spectrogram(Sxx, db_range=96, gain=-5):
+    Sxx_dB = util.power2dB(Sxx, db_range, gain) + 96
+
+    min_threshold = 0
+    max_threshold = 50
+    scaled = ((Sxx_dB - min_threshold) / max_threshold) * 255
+
+    scaled = np.clip(scaled, 0, 255).astype(np.uint8)
+
+    img = Image.fromarray(scaled, mode="L")
+    img = img.transpose(Image.FLIP_TOP_BOTTOM)
+    return img
+
+
+# ============================================================
+# CORE WORKER (IMPORTANT)
+# ============================================================
+
+def process_single_file(audiofilepath, outputdirpath, window_t):
+    """
+    One worker processes ONE audio file,
+    but workers are reused for MANY files.
+    """
+    try:
+        spectrograms_by_ch = get_spectrograms_from_file(audiofilepath, window_t)
+
+        Path(outputdirpath).mkdir(parents=True, exist_ok=True)
+        base = Path(audiofilepath).stem
+
+        # STREAM processing (no big lists in RAM)
+        for ch, spectrograms in enumerate(spectrograms_by_ch):
+            for i, Sxx in enumerate(spectrograms):
+                img = get_image_from_spectrogram(Sxx)
+                out = os.path.join(
+                    outputdirpath,
+                    f"{base}_ch{ch}_{i}.png"
+                )
+                img.save(out, compress_level=1, optimize=False)
+
+        return True, audiofilepath, None
+
+    except Exception as e:
+        return False, audiofilepath, str(e)
+
+
+# ============================================================
+# DIRECTORY SCAN
+# ============================================================
+
+def collect_audio_files(input_directory):
+    audio_exts = {'.flac', '.wav', '.mp3', '.ogg', '.m4a'}
+    file_list = []
+
+    for root, _, files in os.walk(input_directory):
+        for f in files:
+            if Path(f).suffix.lower() in audio_exts:
+                in_path = os.path.join(root, f)
+                rel_dir = os.path.relpath(root, input_directory)
+                file_list.append((in_path, rel_dir))
+
+    return file_list
+
+
+def process_file_wrapper(args, output_base_dir, window_t):
+    input_path, rel_dir = args
+    output_dir = os.path.join(output_base_dir, rel_dir)
+    return process_single_file(input_path, output_dir, window_t)
+
+
+# ============================================================
+# PARALLEL LAUNCHER
+# ============================================================
+
+def parallel_process_directory(
+    input_directory,
+    output_directory,
+    window_t=10,
+    n_workers=8
+):
+    print(f"Input:  {input_directory}")
+    print(f"Output: {output_directory}")
+    print(f"Workers: {n_workers}")
+
+    files = collect_audio_files(input_directory)
+    total = len(files)
+
+    print(f"Found {total} audio files")
+    if total == 0:
+        return
+
+    Path(output_directory).mkdir(parents=True, exist_ok=True)
+
+    process_func = partial(
+        process_file_wrapper,
+        output_base_dir=output_directory,
+        window_t=window_t
+    )
+
+    ok = 0
+    fail = 0
+    errors = []
+
+    with mp.Pool(processes=n_workers) as pool:
+        for i, (success, path, err) in enumerate(
+            pool.imap_unordered(process_func, files), 1
+        ):
+            if success:
+                ok += 1
+            else:
+                fail += 1
+                if len(errors) < 200:
+                    errors.append((path, err))
+
+            if i % 50 == 0 or i == total:
+                print(
+                    f"[{i}/{total}] "
+                    f"{100*i/total:.1f}% | "
+                    f"OK={ok} FAIL={fail}"
+                )
+
+    print("\n================= DONE =================")
+    print(f"Processed: {ok}/{total}")
+    print(f"Failed:    {fail}/{total}")
+
+    if errors:
+        print("\nSome errors:")
+        for p, e in errors:
+            print(" -", p, ":", e)
+
+
+# ============================================================
+# MAIN (WINDOWS SAFE)
+# ============================================================
+
+
+
+
+# Example usage
+if __name__ == "__main__":
+    import time
+
+    t0 = time.perf_counter()
+    # Configuration
+    INPUT_DIR = r"D:\tropic_set\audio\nouragues_19-23\2019\S4A09154\Data"
+    OUTPUT_DIR = r"C:\Users\mboulara\OneDrive - Alcatel Submarine Networks\Bureau\Sorbonne\M2 isi\PFE\2019_specs_samples"
+
+    # Spectrogram parameters
+    WINDOW_SIZE = 10  # seconds
+
+    # Number of workers (None = use all CPU cores)
+    # For your 20-core machine, you might want to use 18-19 to leave some cores free
+    N_WORKERS = 19
+
+    # Run parallel processing
+    parallel_process_directory(
+        input_directory=INPUT_DIR,
+        output_directory=OUTPUT_DIR,
+        window_t=WINDOW_SIZE,
+
+        n_workers=N_WORKERS
+    )
+    t1 = time.perf_counter()
+
+    total_time = t1 - t0
+
+    print("\n================= GLOBAL TIMER =================")
+    print(f"⏱️ Total wall-clock time: {total_time:.1f} seconds ({total_time / 60:.2f} minutes)")
+    print("================================================")
